@@ -1,8 +1,10 @@
 cabal-version:      3.0
 name:               bread-bot
 version:            0.1.0.0
-synopsis:           A discord-haskell bot starter
-description:        A small Discord bot starter with Nix development tooling.
+synopsis:           A Discord bot for resurfacing bread-reacted messages
+description:
+  Breadfish recommends memorable Discord posts marked with bread reactions.
+
 category:           Web
 license:            MIT
 license-file:       LICENSE
