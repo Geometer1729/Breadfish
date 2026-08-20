@@ -21,7 +21,7 @@ import Control.Lens (
   use,
   (^.),
  )
-import Control.Monad.Trans.Except (except, throwE)
+import Control.Monad.Trans.Except (throwE)
 import Data.Map.Strict qualified as Map
 import Data.Text qualified as Text
 import Data.Time.Clock (UTCTime, diffUTCTime, getCurrentTime)
@@ -162,24 +162,23 @@ handleBread breadState interaction = do
   respondWith interaction InteractionResponseDeferChannelMessage
   result <- runExceptT $ do
     guildId <-
-      except $
-        maybeToRight
-          "`/bread` can only be used in a server."
-          (interactionGuildId interaction)
+      interactionGuildId interaction
+        `labelError` pure "`/bread` can only be used in a server."
+    let noBread = liftIO $ emptyBreadResponse breadState guildId
     breadIndex <-
       liftIO (readBreadIndex breadState guildId)
-        >>= maybe (throwE $ emptyBreadResponse Nothing) pure
+        >>= (`labelError` noBread)
     message <-
       lift (selectBreadMessage breadState $ breadIndex ^. indexedBreadMessages)
-        >>= \case
-          Just message -> pure message
-          Nothing -> do
-            currentStatus <-
-              liftIO $
-                fmap (^. breadScanStatus) <$> readBreadIndex breadState guildId
-            throwE $ emptyBreadResponse currentStatus
+        >>= (`labelError` noBread)
     pure (guildId, message)
   finishInteraction interaction $ either id (uncurry breadResponse) result
+
+infixl 1 `labelError`
+
+labelError :: (Monad m) => Maybe a -> m e -> ExceptT e m a
+value `labelError` errorAction =
+  maybe (lift errorAction >>= throwE) pure value
 
 startBreadScan :: BreadState -> GuildId -> [Channel] -> DiscordHandler ()
 startBreadScan breadState guildId channels = do
@@ -422,12 +421,17 @@ modifyBreadMessages breadState guildId update =
   atomicBreadState breadState $
     modifying (ix guildId . indexedBreadMessages) update
 
-emptyBreadResponse :: Maybe BreadScanStatus -> Text
-emptyBreadResponse = \case
-  Just BreadScanning -> "Still gathering bread. Try again shortly."
-  Just BreadFailed -> "The bread scan failed. Check the bot logs and channel permissions."
-  _ ->
-    "No bread-reacted messages found. Check the bot's View Channel and Read Message History permissions."
+emptyBreadResponse :: BreadState -> GuildId -> IO Text
+emptyBreadResponse breadState guildId =
+  readBreadIndex breadState guildId <&> \case
+    Just index -> case index ^. breadScanStatus of
+      BreadScanning -> "Still gathering bread. Try again shortly."
+      BreadFailed -> "The bread scan failed. Check the bot logs and channel permissions."
+      BreadComplete -> noBreadFound
+    Nothing -> noBreadFound
+  where
+    noBreadFound =
+      "No bread-reacted messages found. Check the bot's View Channel and Read Message History permissions."
 
 breadResponse :: GuildId -> Message -> Text
 breadResponse guildId message =
