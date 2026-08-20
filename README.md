@@ -6,8 +6,11 @@ bot starter, built with Cabal and Nix.
 The included bot registers `/ping` and `/bread` commands. A background worker
 scans each server's readable text and news channel history for messages with a
 standard bread reaction, adding results to an in-memory index page by page.
-`/bread` chooses from whatever has been indexed so far, while reaction and
-deletion events keep the index current until the bot restarts.
+`/bread` chooses from whatever has been indexed so far. Messages with more
+bread reactions and older messages receive more weight, with diminishing
+returns, while each selection reduces that message's weight to discourage
+repeats. Reaction and deletion events keep the index current until the bot
+restarts, when selection history is reset.
 
 ## Development
 

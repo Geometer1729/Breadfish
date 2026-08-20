@@ -5,11 +5,13 @@ module Bot (
   eventHandler,
   messageUrl,
   newBreadState,
+  recommendationWeight,
 ) where
 
 import Control.Concurrent (forkIO)
 import Data.Map.Strict qualified as Map
 import Data.Text qualified as Text
+import Data.Time.Clock (UTCTime, diffUTCTime, getCurrentTime)
 import Discord (DiscordHandler, FromJSON, Request, restCall)
 import Discord.Interactions
 import Discord.Internal.Rest.ApplicationCommands (
@@ -58,6 +60,9 @@ data BreadMessage = BreadMessage
   { breadGuildId :: GuildId
   , breadChannelId :: ChannelId
   , breadMessageId :: MessageId
+  , breadReactionCount :: Int
+  , breadPostedAt :: UTCTime
+  , breadSelectionCount :: Int
   }
   deriving stock (Eq, Show)
 
@@ -101,14 +106,19 @@ eventHandler breadState = \case
   MessageReactionAdd reaction
     | isBreadEmoji (reactionEmoji reaction) ->
         whenJust (reactionGuildId reaction) $ \guildId ->
-          liftIO $
-            addBreadMessage
-              breadState
-              BreadMessage
-                { breadGuildId = guildId
-                , breadChannelId = reactionChannelId reaction
-                , breadMessageId = reactionMessageId reaction
-                }
+          refreshBreadMessage
+            breadState
+            guildId
+            (reactionChannelId reaction)
+            (reactionMessageId reaction)
+  MessageReactionRemove reaction
+    | isBreadEmoji (reactionEmoji reaction) ->
+        whenJust (reactionGuildId reaction) $ \guildId ->
+          refreshBreadMessage
+            breadState
+            guildId
+            (reactionChannelId reaction)
+            (reactionMessageId reaction)
   MessageReactionRemoveAll sourceChannelId sourceMessageId ->
     liftIO $ removeBreadMessageEverywhere breadState sourceChannelId sourceMessageId
   MessageReactionRemoveEmoji reaction
@@ -210,18 +220,27 @@ scanChannel breadState guildId sourceChannelId sourceChannelName = do
 
 toBreadMessage :: GuildId -> Message -> Maybe BreadMessage
 toBreadMessage guildId message =
-  if hasBreadReaction message
+  if reactionCount > 0
     then
       Just
         BreadMessage
           { breadGuildId = guildId
           , breadChannelId = messageChannelId message
           , breadMessageId = messageId message
+          , breadReactionCount = reactionCount
+          , breadPostedAt = messageTimestamp message
+          , breadSelectionCount = 0
           }
     else Nothing
+  where
+    reactionCount = messageBreadCount message
 
-hasBreadReaction :: Message -> Bool
-hasBreadReaction = any (isBreadEmoji . messageReactionEmoji) . messageReactions
+messageBreadCount :: Message -> Int
+messageBreadCount =
+  sum
+    . map messageReactionCount
+    . filter (isBreadEmoji . messageReactionEmoji)
+    . messageReactions
 
 isBreadEmoji :: Emoji -> Bool
 isBreadEmoji emoji = isNothing (emojiId emoji) && emojiName emoji == "🍞"
@@ -229,20 +248,60 @@ isBreadEmoji emoji = isNothing (emojiId emoji) && emojiName emoji == "🍞"
 selectBreadMessage :: BreadState -> [BreadMessage] -> DiscordHandler (Maybe Message)
 selectBreadMessage _ [] = pure Nothing
 selectBreadMessage breadState candidates = do
-  selectedIndex <- liftIO $ randomRIO (0, length candidates - 1)
-  case listToMaybe $ drop selectedIndex candidates of
-    Nothing -> pure Nothing
-    Just selected ->
-      restCall
-        ( GetChannelMessage
-            (breadChannelId selected, breadMessageId selected)
-        )
-        >>= \case
-          Right message
-            | hasBreadReaction message -> pure $ Just message
-          _ -> do
-            liftIO $ removeBreadMessage breadState selected
-            selectBreadMessage breadState $ filter (/= selected) candidates
+  now <- liftIO getCurrentTime
+  selected <- liftIO $ weightedRandom $ map (withWeight now) candidates
+  restCall
+    ( GetChannelMessage
+        (breadChannelId selected, breadMessageId selected)
+    )
+    >>= \case
+      Right message
+        | Just refreshed <- toBreadMessage (breadGuildId selected) message -> do
+            liftIO $ do
+              addBreadMessage breadState refreshed
+              markBreadSelected breadState selected
+            pure $ Just message
+      _ -> do
+        liftIO $ removeBreadMessage breadState selected
+        selectBreadMessage breadState $ filter (/= selected) candidates
+
+withWeight :: UTCTime -> BreadMessage -> (BreadMessage, Double)
+withWeight now message =
+  ( message
+  , recommendationWeight
+      (realToFrac (diffUTCTime now $ breadPostedAt message) / 86_400)
+      (breadReactionCount message)
+      (breadSelectionCount message)
+  )
+
+recommendationWeight :: Double -> Int -> Int -> Double
+recommendationWeight ageDays reactionCount selectionCount =
+  popularity * ageBonus / selectionPenalty
+  where
+    popularity = sqrt $ fromIntegral $ max 1 reactionCount
+    ageBonus = 1 + logBase 2 (1 + max 0 ageDays / 30)
+    selectionPenalty = fromIntegral (1 + max 0 selectionCount) ^ (2 :: Int)
+
+weightedRandom :: [(a, Double)] -> IO a
+weightedRandom weighted = do
+  target <- randomRIO (0, sum $ map snd weighted)
+  pure $ pick target weighted
+  where
+    pick _ [(value, _)] = value
+    pick remaining ((value, weight) : rest)
+      | remaining <= weight = value
+      | otherwise = pick (remaining - weight) rest
+    pick _ [] = error "weightedRandom requires at least one candidate"
+
+refreshBreadMessage :: BreadState -> GuildId -> ChannelId -> MessageId -> DiscordHandler ()
+refreshBreadMessage breadState guildId sourceChannelId sourceMessageId =
+  restCall (GetChannelMessage (sourceChannelId, sourceMessageId)) >>= \case
+    Right message ->
+      liftIO $ case toBreadMessage guildId message of
+        Just breadMessage -> addBreadMessage breadState breadMessage
+        Nothing -> removeBreadMessageEverywhere breadState sourceChannelId sourceMessageId
+    Left err ->
+      putTextLn $ "Failed to refresh bread message " <> show sourceMessageId <> ": " <> show err
 
 addBreadMessage :: BreadState -> BreadMessage -> IO ()
 addBreadMessage breadState message =
@@ -257,15 +316,43 @@ addBreadMessages (BreadState breadByGuild) guildId messages =
         guildId
 
 upsertBreadMessage :: BreadMessage -> [BreadMessage] -> [BreadMessage]
-upsertBreadMessage message messages =
-  message : filter ((/= breadMessageId message) . breadMessageId) messages
+upsertBreadMessage message = \case
+  [] -> [message]
+  existing : rest
+    | sameBreadMessage message existing ->
+        message {breadSelectionCount = breadSelectionCount existing} : rest
+    | otherwise -> existing : upsertBreadMessage message rest
+
+sameBreadMessage :: BreadMessage -> BreadMessage -> Bool
+sameBreadMessage left right =
+  breadChannelId left == breadChannelId right
+    && breadMessageId left == breadMessageId right
+
+markBreadSelected :: BreadState -> BreadMessage -> IO ()
+markBreadSelected (BreadState breadByGuild) selected =
+  atomically $
+    modifyTVar' breadByGuild $
+      Map.adjust
+        ( \index ->
+            index
+              { indexedBreadMessages =
+                  map
+                    ( \message ->
+                        if sameBreadMessage message selected
+                          then message {breadSelectionCount = breadSelectionCount message + 1}
+                          else message
+                    )
+                    (indexedBreadMessages index)
+              }
+        )
+        (breadGuildId selected)
 
 removeBreadMessage :: BreadState -> BreadMessage -> IO ()
 removeBreadMessage (BreadState breadByGuild) message =
   atomically $
     modifyTVar' breadByGuild $
       Map.adjust
-        (\index -> index {indexedBreadMessages = filter (/= message) $ indexedBreadMessages index})
+        (\index -> index {indexedBreadMessages = filter (not . sameBreadMessage message) $ indexedBreadMessages index})
         (breadGuildId message)
 
 removeBreadMessageEverywhere :: BreadState -> ChannelId -> MessageId -> IO ()
