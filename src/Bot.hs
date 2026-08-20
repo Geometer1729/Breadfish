@@ -1,3 +1,5 @@
+{-# LANGUAGE TemplateHaskell #-}
+
 module Bot (
   BreadState,
   commandResponse,
@@ -8,6 +10,17 @@ module Bot (
 ) where
 
 import Control.Concurrent (forkIO)
+import Control.Concurrent.STM.TVar (stateTVar)
+import Control.Lens (
+  assign,
+  at,
+  ix,
+  makeLenses,
+  modifying,
+  traversed,
+  use,
+  (^.),
+ )
 import Control.Monad.Trans.Except (except, throwE)
 import Data.Map.Strict qualified as Map
 import Data.Text qualified as Text
@@ -46,8 +59,8 @@ import System.Random (randomRIO)
 newtype BreadState = BreadState (TVar (Map GuildId GuildBreadIndex))
 
 data GuildBreadIndex = GuildBreadIndex
-  { indexedBreadMessages :: [BreadMessage]
-  , breadScanStatus :: BreadScanStatus
+  { _indexedBreadMessages :: [BreadMessage]
+  , _breadScanStatus :: BreadScanStatus
   }
 
 data BreadScanStatus
@@ -66,8 +79,20 @@ data BreadMessage = BreadMessage
   }
   deriving stock (Eq, Show)
 
+makeLenses ''GuildBreadIndex
+
 newBreadState :: IO BreadState
 newBreadState = BreadState <$> newTVarIO Map.empty
+
+atomicBreadState ::
+  BreadState -> State (Map GuildId GuildBreadIndex) a -> IO a
+atomicBreadState (BreadState breadByGuild) action =
+  atomically $ stateTVar breadByGuild $ runState action
+
+readBreadState ::
+  BreadState -> (Map GuildId GuildBreadIndex -> a) -> IO a
+readBreadState (BreadState breadByGuild) query =
+  query <$> readTVarIO breadByGuild
 
 commands :: [CreateApplicationCommand]
 commands =
@@ -145,12 +170,13 @@ handleBread breadState interaction = do
       liftIO (readBreadIndex breadState guildId)
         >>= maybe (throwE $ emptyBreadResponse Nothing) pure
     message <-
-      lift (selectBreadMessage breadState $ indexedBreadMessages breadIndex)
+      lift (selectBreadMessage breadState $ breadIndex ^. indexedBreadMessages)
         >>= \case
           Just message -> pure message
           Nothing -> do
             currentStatus <-
-              liftIO $ fmap breadScanStatus <$> readBreadIndex breadState guildId
+              liftIO $
+                fmap (^. breadScanStatus) <$> readBreadIndex breadState guildId
             throwE $ emptyBreadResponse currentStatus
     pure (guildId, message)
   finishInteraction interaction $ either id (uncurry breadResponse) result
@@ -177,7 +203,7 @@ scanGuild breadState guildId channels = do
   liftIO $ setBreadScanStatus breadState guildId BreadComplete
   breadCount <-
     liftIO $
-      maybe 0 (length . indexedBreadMessages)
+      maybe 0 (length . (^. indexedBreadMessages))
         <$> readBreadIndex breadState guildId
   putTextLn $ "Bread index contains " <> show breadCount <> " messages"
 
@@ -361,55 +387,40 @@ removeBreadMessage breadState message =
       not . sameBreadMessage message
 
 removeBreadMessageEverywhere :: BreadState -> ChannelId -> MessageId -> IO ()
-removeBreadMessageEverywhere breadState sourceChannelId sourceMessageId =
-  modifyBreadState breadState $
-    Map.map $
-      updateBreadMessages $
+removeBreadMessageEverywhere
+  breadState
+  sourceChannelId
+  sourceMessageId =
+    atomicBreadState breadState $
+      modifying (traversed . indexedBreadMessages) $
         filter $ \message ->
           breadChannelId message /= sourceChannelId
             || breadMessageId message /= sourceMessageId
 
 beginBreadScan :: BreadState -> GuildId -> IO Bool
-beginBreadScan (BreadState breadByGuild) guildId =
-  atomically $ do
-    indexes <- readTVar breadByGuild
-    if Map.member guildId indexes
-      then pure False
-      else do
-        writeTVar breadByGuild $
-          Map.insert guildId (GuildBreadIndex [] BreadScanning) indexes
+beginBreadScan breadState guildId =
+  atomicBreadState breadState $ do
+    existing <- use $ at guildId
+    case existing of
+      Just _ -> pure False
+      Nothing -> do
+        assign (at guildId) $ Just $ GuildBreadIndex [] BreadScanning
         pure True
 
 readBreadIndex :: BreadState -> GuildId -> IO (Maybe GuildBreadIndex)
-readBreadIndex (BreadState breadByGuild) guildId =
-  Map.lookup guildId <$> readTVarIO breadByGuild
+readBreadIndex breadState guildId =
+  readBreadState breadState (^. at guildId)
 
 setBreadScanStatus :: BreadState -> GuildId -> BreadScanStatus -> IO ()
 setBreadScanStatus breadState guildId status =
-  modifyBreadIndex breadState guildId $ \index ->
-    index {breadScanStatus = status}
-
-modifyBreadState ::
-  BreadState ->
-  (Map GuildId GuildBreadIndex -> Map GuildId GuildBreadIndex) ->
-  IO ()
-modifyBreadState (BreadState breadByGuild) update =
-  atomically $ modifyTVar' breadByGuild update
-
-modifyBreadIndex ::
-  BreadState -> GuildId -> (GuildBreadIndex -> GuildBreadIndex) -> IO ()
-modifyBreadIndex breadState guildId update =
-  modifyBreadState breadState $ Map.adjust update guildId
+  atomicBreadState breadState $
+    assign (ix guildId . breadScanStatus) status
 
 modifyBreadMessages ::
   BreadState -> GuildId -> ([BreadMessage] -> [BreadMessage]) -> IO ()
 modifyBreadMessages breadState guildId update =
-  modifyBreadIndex breadState guildId $ updateBreadMessages update
-
-updateBreadMessages ::
-  ([BreadMessage] -> [BreadMessage]) -> GuildBreadIndex -> GuildBreadIndex
-updateBreadMessages update index =
-  index {indexedBreadMessages = update $ indexedBreadMessages index}
+  atomicBreadState breadState $
+    modifying (ix guildId . indexedBreadMessages) update
 
 emptyBreadResponse :: Maybe BreadScanStatus -> Text
 emptyBreadResponse = \case
