@@ -1,6 +1,6 @@
 module Main (main) where
 
-import Bot (eventHandler)
+import Bot (eventHandler, newBreadState)
 import Data.Text qualified as Text
 import Discord (RunDiscordOpts (..), def, runDiscord)
 import Discord.Types (GatewayIntent (..))
@@ -8,13 +8,14 @@ import Discord.Types (GatewayIntent (..))
 main :: IO ()
 main = do
   token <- loadToken
+  breadState <- newBreadState
   result <-
     runDiscord
       def
         { discordToken = token
         , discordOnStart = liftIO $ putTextLn "Starting bread-bot"
-        , discordOnEvent = eventHandler
-        , discordGatewayIntent = def {gatewayIntentMessageContent = False}
+        , discordOnEvent = eventHandler breadState
+        , discordGatewayIntent = def {gatewayIntentMessageContent = True}
         }
   print result
 

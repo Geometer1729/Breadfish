@@ -3,9 +3,11 @@
 A small [discord-haskell](https://hackage.haskell.org/package/discord-haskell)
 bot starter, built with Cabal and Nix.
 
-The included bot registers a global `/ping` command and responds with `Pong!`.
-Its command response is kept pure and covered by a small Hspec test so that bot
-logic can grow without requiring a Discord connection in tests.
+The included bot registers `/ping` and `/bread` commands. A background worker
+scans each server's readable text and news channel history for messages with a
+standard bread reaction, adding results to an in-memory index page by page.
+`/bread` chooses from whatever has been indexed so far, while reaction and
+deletion events keep the index current until the bot restarts.
 
 ## Development
 
@@ -37,8 +39,15 @@ The flake exposes the same executable as its default package and app, so
 
 1. Create an application and bot in the
    [Discord Developer Portal](https://discord.com/developers/applications).
-2. Install it in a server with the `bot` and `applications.commands` scopes.
-3. Provide the bot token through `DISCORD_TOKEN`:
+2. Enable Message Content Intent on the application's **Bot** page. Discord
+   gates historical attachment metadata behind this intent.
+3. Install Breadfish using the
+   [server authorization link](https://discord.com/oauth2/authorize?client_id=1539782184850952392&permissions=68608&scope=bot%20applications.commands).
+   It requests the `bot` and `applications.commands` scopes with View Channels,
+   Send Messages, and Read Message History permissions. An
+   `applications.commands`-only installation can respond to slash commands but
+   cannot read server channels.
+4. Provide the bot token through `DISCORD_TOKEN`:
 
 ```console
 DISCORD_TOKEN='your-token' just run
@@ -57,5 +66,8 @@ registration requests for a development server.
 - Add slash-command definitions to `commands` in `src/Bot.hs`.
 - Add pure command behavior to `commandResponse` and test it in `test/Spec.hs`.
 - Extend `eventHandler` for components, autocomplete, messages, or guild events.
-- Enable only the gateway intents required by those new event handlers in
-  `app/Main.hs`; the starter command needs no privileged intents.
+- Enable only the gateway intents required by event handlers in `app/Main.hs`.
+
+The history scan intentionally excludes threads and channels the bot cannot
+read. A persistent index is the next step if repeating the background scan on
+each restart becomes too expensive.
