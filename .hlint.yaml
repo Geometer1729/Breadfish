@@ -1,0 +1,4 @@
+- arguments:
+    - -XImportQualifiedPost
+    - -XLambdaCase
+    - -XOverloadedStrings

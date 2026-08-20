@@ -1,0 +1,18 @@
+# Cabal
+dist
+dist-*
+cabal.project.local
+cabal.project.local~
+
+# Nix
+result
+result-*
+
+# direnv
+.direnv
+
+# Secrets
+.env
+.env.*
+/token
+/token.auth
