@@ -27,6 +27,7 @@
 
     fourmolu.settings = {
       indentation = 2;
+      column-limit = 80;
       comma-style = "leading";
       record-brace-space = true;
       indent-wheres = true;

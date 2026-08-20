@@ -1,7 +1,6 @@
 module Bot (
   BreadState,
   commandResponse,
-  commands,
   eventHandler,
   messageUrl,
   newBreadState,
@@ -9,6 +8,7 @@ module Bot (
 ) where
 
 import Control.Concurrent (forkIO)
+import Control.Monad.Trans.Except (except, throwE)
 import Data.Map.Strict qualified as Map
 import Data.Text qualified as Text
 import Data.Time.Clock (UTCTime, diffUTCTime, getCurrentTime)
@@ -71,8 +71,8 @@ newBreadState = BreadState <$> newTVarIO Map.empty
 
 commands :: [CreateApplicationCommand]
 commands =
-  [ simpleCommand "ping" "Check whether the bot is running" Nothing
-  , simpleCommand "bread" "Find a random message with a bread reaction" Nothing
+  [ simpleCommand "ping" "Check whether the bot is running"
+  , simpleCommand "bread" "Find a random message with a bread reaction"
   ]
 
 commandResponse :: Text -> Maybe Text
@@ -91,34 +91,30 @@ eventHandler breadState = \case
       breadState
       (DiscordTypes.guildId guild)
       (guildCreateChannels guildData)
-  InteractionCreate interaction ->
-    case interaction of
-      InteractionApplicationCommand
-        { applicationCommandData =
-          ApplicationCommandDataChatInput
-            { applicationCommandDataName = commandName
-            }
-        } ->
-          if commandName == "bread"
-            then handleBread breadState interaction
-            else whenJust (commandResponse commandName) $ respond interaction
-      _ -> pass
-  MessageReactionAdd reaction
-    | isBreadEmoji (reactionEmoji reaction) ->
-        whenJust (reactionGuildId reaction) $ \guildId ->
-          refreshBreadMessage
-            breadState
-            guildId
-            (reactionChannelId reaction)
-            (reactionMessageId reaction)
-  MessageReactionRemove reaction
-    | isBreadEmoji (reactionEmoji reaction) ->
-        whenJust (reactionGuildId reaction) $ \guildId ->
-          refreshBreadMessage
-            breadState
-            guildId
-            (reactionChannelId reaction)
-            (reactionMessageId reaction)
+  InteractionCreate
+    interaction@InteractionApplicationCommand
+      { applicationCommandData =
+        ApplicationCommandDataChatInput
+          { applicationCommandDataName = commandName
+          }
+      }
+      | commandName == "bread" -> handleBread breadState interaction
+      | Just content <- commandResponse commandName ->
+          respondWith interaction $ interactionResponseBasic content
+  MessageReactionAdd reaction ->
+    refreshBreadReaction
+      breadState
+      (reactionEmoji reaction)
+      (reactionGuildId reaction)
+      (reactionChannelId reaction)
+      (reactionMessageId reaction)
+  MessageReactionRemove reaction ->
+    refreshBreadReaction
+      breadState
+      (reactionEmoji reaction)
+      (reactionGuildId reaction)
+      (reactionChannelId reaction)
+      (reactionMessageId reaction)
   MessageReactionRemoveAll sourceChannelId sourceMessageId ->
     liftIO $ removeBreadMessageEverywhere breadState sourceChannelId sourceMessageId
   MessageReactionRemoveEmoji reaction
@@ -139,56 +135,62 @@ eventHandler breadState = \case
 handleBread :: BreadState -> Interaction -> DiscordHandler ()
 handleBread breadState interaction = do
   respondWith interaction InteractionResponseDeferChannelMessage
-  case interactionGuildId interaction of
-    Nothing -> finishInteraction interaction "`/bread` can only be used in a server."
-    Just guildId -> do
-      breadIndex <- liftIO $ readBreadIndex breadState guildId
-      case breadIndex of
-        Nothing -> finishInteraction interaction "Still gathering bread. Try again shortly."
-        Just index -> do
-          selected <- selectBreadMessage breadState $ indexedBreadMessages index
-          case selected of
-            Just message -> finishInteraction interaction $ breadResponse guildId message
-            Nothing -> do
-              currentStatus <- liftIO $ fmap breadScanStatus <$> readBreadIndex breadState guildId
-              finishInteraction interaction $ emptyBreadResponse currentStatus
+  result <- runExceptT $ do
+    guildId <-
+      except $
+        maybeToRight
+          "`/bread` can only be used in a server."
+          (interactionGuildId interaction)
+    breadIndex <-
+      liftIO (readBreadIndex breadState guildId)
+        >>= maybe (throwE $ emptyBreadResponse Nothing) pure
+    message <-
+      lift (selectBreadMessage breadState $ indexedBreadMessages breadIndex)
+        >>= \case
+          Just message -> pure message
+          Nothing -> do
+            currentStatus <-
+              liftIO $ fmap breadScanStatus <$> readBreadIndex breadState guildId
+            throwE $ emptyBreadResponse currentStatus
+    pure (guildId, message)
+  finishInteraction interaction $ either id (uncurry breadResponse) result
 
 startBreadScan :: BreadState -> GuildId -> [Channel] -> DiscordHandler ()
-startBreadScan breadState@(BreadState breadByGuild) guildId channels = do
-  shouldStart <- liftIO $ atomically $ do
-    indexes <- readTVar breadByGuild
-    if Map.member guildId indexes
-      then pure False
-      else do
-        writeTVar breadByGuild $
-          Map.insert guildId (GuildBreadIndex [] BreadScanning) indexes
-        pure True
+startBreadScan breadState guildId channels = do
+  shouldStart <- liftIO $ beginBreadScan breadState guildId
   when shouldStart $ do
     putTextLn $ "Starting bread scan for guild " <> show guildId
     discordHandle <- ask
-    void $ liftIO $ forkIO $ runReaderT (scanGuild breadState guildId channels) discordHandle
+    void $
+      liftIO $
+        forkIO $
+          runReaderT (scanGuild breadState guildId channels) discordHandle
 
 scanGuild :: BreadState -> GuildId -> [Channel] -> DiscordHandler ()
 scanGuild breadState guildId channels = do
   let historyChannels = mapMaybe historyChannel channels
-  putTextLn $ "Scanning " <> show (length historyChannels) <> " channels for bread"
+  putTextLn $
+    "Scanning " <> show (length historyChannels) <> " channels for bread"
   traverse_
     (uncurry $ scanChannel breadState guildId)
     historyChannels
   liftIO $ setBreadScanStatus breadState guildId BreadComplete
-  breadIndex <- liftIO $ readBreadIndex breadState guildId
-  let breadCount = maybe 0 (length . indexedBreadMessages) breadIndex
+  breadCount <-
+    liftIO $
+      maybe 0 (length . indexedBreadMessages)
+        <$> readBreadIndex breadState guildId
   putTextLn $ "Bread index contains " <> show breadCount <> " messages"
 
 historyChannel :: Channel -> Maybe (ChannelId, Text)
-historyChannel channel = case channel of
-  ChannelText {} -> Just (channelId channel, channelName channel)
-  ChannelNews {} -> Just (channelId channel, channelName channel)
+historyChannel = \case
+  channel@ChannelText {} -> Just (channelId channel, channelName channel)
+  channel@ChannelNews {} -> Just (channelId channel, channelName channel)
   _ -> Nothing
 
 scanChannel :: BreadState -> GuildId -> ChannelId -> Text -> DiscordHandler ()
 scanChannel breadState guildId sourceChannelId sourceChannelName = do
-  putTextLn $ "Starting channel #" <> sourceChannelName <> " (" <> show sourceChannelId <> ")"
+  putTextLn $
+    "Starting channel #" <> sourceChannelName <> " (" <> show sourceChannelId <> ")"
   (messagesChecked, breadFound) <- go LatestMessages 0 0
   putTextLn $
     "Finished channel #"
@@ -211,29 +213,25 @@ scanChannel breadState guildId sourceChannelId sourceChannelName = do
               messagesChecked' = messagesChecked + length messages
               breadFound' = breadFound + length breadMessages
           liftIO $ addBreadMessages breadState guildId breadMessages
-          if length messages < 100
-            then pure (messagesChecked', breadFound')
-            else case reverse messages of
-              oldest : _ ->
+          if
+            | length messages < 100 -> pure (messagesChecked', breadFound')
+            | oldest : _ <- reverse messages ->
                 go (BeforeMessage $ messageId oldest) messagesChecked' breadFound'
-              [] -> pure (messagesChecked', breadFound')
+            | otherwise -> pure (messagesChecked', breadFound')
 
 toBreadMessage :: GuildId -> Message -> Maybe BreadMessage
-toBreadMessage guildId message =
-  if reactionCount > 0
-    then
-      Just
-        BreadMessage
-          { breadGuildId = guildId
-          , breadChannelId = messageChannelId message
-          , breadMessageId = messageId message
-          , breadReactionCount = reactionCount
-          , breadPostedAt = messageTimestamp message
-          , breadSelectionCount = 0
-          }
-    else Nothing
-  where
-    reactionCount = messageBreadCount message
+toBreadMessage guildId message = do
+  let reactionCount = messageBreadCount message
+  guard $ reactionCount > 0
+  pure
+    BreadMessage
+      { breadGuildId = guildId
+      , breadChannelId = messageChannelId message
+      , breadMessageId = messageId message
+      , breadReactionCount = reactionCount
+      , breadPostedAt = messageTimestamp message
+      , breadSelectionCount = 0
+      }
 
 messageBreadCount :: Message -> Int
 messageBreadCount =
@@ -245,7 +243,8 @@ messageBreadCount =
 isBreadEmoji :: Emoji -> Bool
 isBreadEmoji emoji = isNothing (emojiId emoji) && emojiName emoji == "🍞"
 
-selectBreadMessage :: BreadState -> [BreadMessage] -> DiscordHandler (Maybe Message)
+selectBreadMessage ::
+  BreadState -> [BreadMessage] -> DiscordHandler (Maybe Message)
 selectBreadMessage _ [] = pure Nothing
 selectBreadMessage breadState candidates = do
   now <- liftIO getCurrentTime
@@ -293,7 +292,28 @@ weightedRandom weighted = do
       | otherwise = pick (remaining - weight) rest
     pick _ [] = error "weightedRandom requires at least one candidate"
 
-refreshBreadMessage :: BreadState -> GuildId -> ChannelId -> MessageId -> DiscordHandler ()
+refreshBreadReaction ::
+  BreadState ->
+  Emoji ->
+  Maybe GuildId ->
+  ChannelId ->
+  MessageId ->
+  DiscordHandler ()
+refreshBreadReaction breadState emoji guildId sourceChannelId sourceMessageId =
+  when (isBreadEmoji emoji) $
+    whenJust guildId $ \sourceGuildId ->
+      refreshBreadMessage
+        breadState
+        sourceGuildId
+        sourceChannelId
+        sourceMessageId
+
+refreshBreadMessage ::
+  BreadState ->
+  GuildId ->
+  ChannelId ->
+  MessageId ->
+  DiscordHandler ()
 refreshBreadMessage breadState guildId sourceChannelId sourceMessageId =
   restCall (GetChannelMessage (sourceChannelId, sourceMessageId)) >>= \case
     Right message ->
@@ -301,19 +321,17 @@ refreshBreadMessage breadState guildId sourceChannelId sourceMessageId =
         Just breadMessage -> addBreadMessage breadState breadMessage
         Nothing -> removeBreadMessageEverywhere breadState sourceChannelId sourceMessageId
     Left err ->
-      putTextLn $ "Failed to refresh bread message " <> show sourceMessageId <> ": " <> show err
+      putTextLn $
+        "Failed to refresh bread message " <> show sourceMessageId <> ": " <> show err
 
 addBreadMessage :: BreadState -> BreadMessage -> IO ()
 addBreadMessage breadState message =
   addBreadMessages breadState (breadGuildId message) [message]
 
 addBreadMessages :: BreadState -> GuildId -> [BreadMessage] -> IO ()
-addBreadMessages (BreadState breadByGuild) guildId messages =
-  atomically $
-    modifyTVar' breadByGuild $
-      Map.adjust
-        (\index -> index {indexedBreadMessages = foldr upsertBreadMessage (indexedBreadMessages index) messages})
-        guildId
+addBreadMessages breadState guildId messages =
+  modifyBreadMessages breadState guildId $ \existing ->
+    foldr upsertBreadMessage existing messages
 
 upsertBreadMessage :: BreadMessage -> [BreadMessage] -> [BreadMessage]
 upsertBreadMessage message = \case
@@ -329,57 +347,69 @@ sameBreadMessage left right =
     && breadMessageId left == breadMessageId right
 
 markBreadSelected :: BreadState -> BreadMessage -> IO ()
-markBreadSelected (BreadState breadByGuild) selected =
-  atomically $
-    modifyTVar' breadByGuild $
-      Map.adjust
-        ( \index ->
-            index
-              { indexedBreadMessages =
-                  map
-                    ( \message ->
-                        if sameBreadMessage message selected
-                          then message {breadSelectionCount = breadSelectionCount message + 1}
-                          else message
-                    )
-                    (indexedBreadMessages index)
-              }
-        )
-        (breadGuildId selected)
+markBreadSelected breadState selected =
+  modifyBreadMessages breadState (breadGuildId selected) $
+    map $ \message ->
+      if sameBreadMessage message selected
+        then message {breadSelectionCount = breadSelectionCount message + 1}
+        else message
 
 removeBreadMessage :: BreadState -> BreadMessage -> IO ()
-removeBreadMessage (BreadState breadByGuild) message =
-  atomically $
-    modifyTVar' breadByGuild $
-      Map.adjust
-        (\index -> index {indexedBreadMessages = filter (not . sameBreadMessage message) $ indexedBreadMessages index})
-        (breadGuildId message)
+removeBreadMessage breadState message =
+  modifyBreadMessages breadState (breadGuildId message) $
+    filter $
+      not . sameBreadMessage message
 
 removeBreadMessageEverywhere :: BreadState -> ChannelId -> MessageId -> IO ()
-removeBreadMessageEverywhere (BreadState breadByGuild) sourceChannelId sourceMessageId =
-  atomically $
-    modifyTVar' breadByGuild $
-      Map.map $
-        \index ->
-          index
-            { indexedBreadMessages =
-                filter
-                  ( \message ->
-                      breadChannelId message /= sourceChannelId
-                        || breadMessageId message /= sourceMessageId
-                  )
-                  (indexedBreadMessages index)
-            }
+removeBreadMessageEverywhere breadState sourceChannelId sourceMessageId =
+  modifyBreadState breadState $
+    Map.map $
+      updateBreadMessages $
+        filter $ \message ->
+          breadChannelId message /= sourceChannelId
+            || breadMessageId message /= sourceMessageId
+
+beginBreadScan :: BreadState -> GuildId -> IO Bool
+beginBreadScan (BreadState breadByGuild) guildId =
+  atomically $ do
+    indexes <- readTVar breadByGuild
+    if Map.member guildId indexes
+      then pure False
+      else do
+        writeTVar breadByGuild $
+          Map.insert guildId (GuildBreadIndex [] BreadScanning) indexes
+        pure True
 
 readBreadIndex :: BreadState -> GuildId -> IO (Maybe GuildBreadIndex)
 readBreadIndex (BreadState breadByGuild) guildId =
   Map.lookup guildId <$> readTVarIO breadByGuild
 
 setBreadScanStatus :: BreadState -> GuildId -> BreadScanStatus -> IO ()
-setBreadScanStatus (BreadState breadByGuild) guildId status =
-  atomically $
-    modifyTVar' breadByGuild $
-      Map.adjust (\index -> index {breadScanStatus = status}) guildId
+setBreadScanStatus breadState guildId status =
+  modifyBreadIndex breadState guildId $ \index ->
+    index {breadScanStatus = status}
+
+modifyBreadState ::
+  BreadState ->
+  (Map GuildId GuildBreadIndex -> Map GuildId GuildBreadIndex) ->
+  IO ()
+modifyBreadState (BreadState breadByGuild) update =
+  atomically $ modifyTVar' breadByGuild update
+
+modifyBreadIndex ::
+  BreadState -> GuildId -> (GuildBreadIndex -> GuildBreadIndex) -> IO ()
+modifyBreadIndex breadState guildId update =
+  modifyBreadState breadState $ Map.adjust update guildId
+
+modifyBreadMessages ::
+  BreadState -> GuildId -> ([BreadMessage] -> [BreadMessage]) -> IO ()
+modifyBreadMessages breadState guildId update =
+  modifyBreadIndex breadState guildId $ updateBreadMessages update
+
+updateBreadMessages ::
+  ([BreadMessage] -> [BreadMessage]) -> GuildBreadIndex -> GuildBreadIndex
+updateBreadMessages update index =
+  index {indexedBreadMessages = update $ indexedBreadMessages index}
 
 emptyBreadResponse :: Maybe BreadScanStatus -> Text
 emptyBreadResponse = \case
@@ -414,10 +444,6 @@ syncCommands :: ApplicationId -> DiscordHandler ()
 syncCommands applicationId =
   discordCall_ $ BulkOverWriteGlobalApplicationCommand applicationId commands
 
-respond :: Interaction -> Text -> DiscordHandler ()
-respond interaction content =
-  respondWith interaction $ interactionResponseBasic content
-
 respondWith :: Interaction -> InteractionResponse -> DiscordHandler ()
 respondWith interaction response =
   discordCall_ $
@@ -434,23 +460,27 @@ finishInteraction interaction content =
       (interactionToken interaction)
       (interactionResponseMessageBasic content)
 
-discordCall_ :: (Request (request response), FromJSON response) => request response -> DiscordHandler ()
+discordCall_ ::
+  (Request (request response), FromJSON response) =>
+  request response -> DiscordHandler ()
 discordCall_ = void . discordCall
 
-discordCall :: (Request (request response), FromJSON response) => request response -> DiscordHandler response
+discordCall ::
+  (Request (request response), FromJSON response) =>
+  request response -> DiscordHandler response
 discordCall request =
   restCall request >>= \case
     Right response -> pure response
     Left err -> die $ show err
 
-simpleCommand :: Text -> Text -> Maybe Options -> CreateApplicationCommand
-simpleCommand name description options =
+simpleCommand :: Text -> Text -> CreateApplicationCommand
+simpleCommand name description =
   CreateApplicationCommandChatInput
     { createName = name
     , createLocalizedName = Nothing
     , createDescription = description
     , createLocalizedDescription = Nothing
-    , createOptions = options
+    , createOptions = Nothing
     , createDefaultMemberPermissions = Nothing
     , createDMPermission = Nothing
     }
