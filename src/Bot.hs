@@ -210,6 +210,7 @@ historyChannel :: Channel -> Maybe (ChannelId, Text)
 historyChannel = \case
   channel@ChannelText {} -> Just (channelId channel, channelName channel)
   channel@ChannelNews {} -> Just (channelId channel, channelName channel)
+  channel@ChannelVoice {} -> Just (channelId channel, channelName channel)
   _ -> Nothing
 
 scanChannel :: BreadState -> GuildId -> ChannelId -> Text -> DiscordHandler ()
